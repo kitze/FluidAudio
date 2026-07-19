@@ -23,6 +23,42 @@ final class TdtDecoderV3HelperTests: XCTestCase {
 
     // MARK: - Extract Encoder Time Step Tests
 
+    func testRepeatedNonBlankAtSameFrameForcesForwardProgress() {
+        let duration = TdtDecoderV3.durationEnsuringForwardProgress(
+            0,
+            isBlank: false,
+            currentTimeIndex: 42,
+            lastEmissionTimestamp: 42,
+            emissionsAtCurrentTimestamp: 1
+        )
+
+        XCTAssertEqual(duration, 1)
+    }
+
+    func testFirstNonBlankAtFramePreservesZeroDuration() {
+        let duration = TdtDecoderV3.durationEnsuringForwardProgress(
+            0,
+            isBlank: false,
+            currentTimeIndex: 42,
+            lastEmissionTimestamp: 41,
+            emissionsAtCurrentTimestamp: 1
+        )
+
+        XCTAssertEqual(duration, 0)
+    }
+
+    func testZeroDurationBlankStillForcesForwardProgress() {
+        let duration = TdtDecoderV3.durationEnsuringForwardProgress(
+            0,
+            isBlank: true,
+            currentTimeIndex: 42,
+            lastEmissionTimestamp: 42,
+            emissionsAtCurrentTimestamp: 1
+        )
+
+        XCTAssertEqual(duration, 1)
+    }
+
     func testExtractEncoderTimeStep() throws {
 
         // Create encoder output: [batch=1, sequence=5, hidden=4]

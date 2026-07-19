@@ -2,6 +2,12 @@
 
 # FluidAudio - Transcription, Text-to-speech, VAD, Speaker diarization with CoreML Models
 
+> **Sotto maintenance branch:** `sotto-v0.7.11-nonblank-loop-fix` is based exactly on
+> FluidAudio v0.7.11 (`33ab1d4440aab8ec6ab4c8633822a8cb55f91b15`) and backports only
+> [upstream PR #244](https://github.com/FluidInference/FluidAudio/pull/244), which prevents
+> repeated duration-zero non-blank tokens from stalling Parakeet decoding. Sotto pins the
+> resulting immutable commit; upstream remains the authority for every other change.
+
 [![Swift](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20iOS-blue.svg)](https://developer.apple.com)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289da.svg)](https://discord.gg/WNsvaCtmDe)

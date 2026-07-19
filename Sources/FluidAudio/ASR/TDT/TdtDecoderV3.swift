@@ -48,6 +48,25 @@ internal struct TdtDecoderV3 {
         self.config = config
     }
 
+    static func durationEnsuringForwardProgress(
+        _ duration: Int,
+        isBlank: Bool,
+        currentTimeIndex: Int,
+        lastEmissionTimestamp: Int,
+        emissionsAtCurrentTimestamp: Int
+    ) -> Int {
+        if !isBlank && duration == 0
+            && currentTimeIndex == lastEmissionTimestamp
+            && emissionsAtCurrentTimestamp >= 1
+        {
+            return 1
+        }
+        if isBlank && duration == 0 {
+            return 1
+        }
+        return duration
+    }
+
     /// Reusable input provider that holds references to preallocated
     /// encoder and decoder step tensors for the joint model.
     private final class ReusableJointInput: NSObject, MLFeatureProvider {
@@ -283,11 +302,15 @@ internal struct TdtDecoderV3 {
             let blankId = config.tdtConfig.blankId  // 8192 for v3 models
             var blankMask = (label == blankId)  // Is this a blank (silence) token?
 
-            // CRITICAL FIX: Prevent infinite loops when blank has duration=0
-            // Always advance at least 1 frame to ensure forward progress
-            if blankMask && duration == 0 {
-                duration = 1
-            }
+            // Preserve one same-frame token, then force progress if the model
+            // predicts another non-blank token with duration zero.
+            duration = Self.durationEnsuringForwardProgress(
+                duration,
+                isBlank: blankMask,
+                currentTimeIndex: timeIndices,
+                lastEmissionTimestamp: lastEmissionTimestamp,
+                emissionsAtCurrentTimestamp: emissionsAtThisTimestamp
+            )
 
             // Advance through audio frames based on predicted duration
             timeIndicesCurrentLabels = timeIndices  // Remember where this token was emitted
