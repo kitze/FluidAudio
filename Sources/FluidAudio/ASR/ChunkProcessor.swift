@@ -201,7 +201,11 @@ struct ChunkProcessor {
         let lastEnd = windowData.last.map {
             Int(Double($0.timestamp + 1) * Double(ASRConstants.samplesPerEncoderFrame))
         }
-        let recover = Self.needsRecovery(
+        let interiorGap = Self.interiorGaps(
+            timestamps: windowData.map(\.timestamp), window: chunkStart..<chunkEnd,
+            samplesPerSecond: sampleRate
+        ).contains { !isSilent(Array(audioSamples[$0])) }
+        let recover = interiorGap || Self.needsRecovery(
             tokenCount: windowData.count,
             firstTokenStart: firstStart,
             lastTokenEnd: lastEnd,
@@ -218,18 +222,48 @@ struct ChunkProcessor {
             return windowData
         }
 
-        let mid = frameAligned(chunkStart + (chunkEnd - chunkStart) / 2)
-        guard mid > chunkStart, mid < chunkEnd else { return windowData }
-
+        guard let ranges = recoveryRanges(for: chunkStart..<chunkEnd) else { return windowData }
         let left = try await transcribeWindow(
-            chunkStart: chunkStart, chunkEnd: mid, isLastChunk: false, depth: depth + 1, using: manager)
+            chunkStart: ranges.left.lowerBound, chunkEnd: ranges.left.upperBound,
+            isLastChunk: false, depth: depth + 1, using: manager)
         let right = try await transcribeWindow(
-            chunkStart: mid, chunkEnd: chunkEnd, isLastChunk: isLastChunk, depth: depth + 1, using: manager)
+            chunkStart: ranges.right.lowerBound, chunkEnd: ranges.right.upperBound,
+            isLastChunk: isLastChunk, depth: depth + 1, using: manager)
 
-        // Keep whichever side produced more: a split that recovers nothing must not replace what
-        // the original window already decoded.
-        guard left.count + right.count > windowData.count else { return windowData }
-        return mergeChunks(left, right)
+        // Compare after stitching so overlap duplicates cannot inflate the apparent recovery.
+        // A split that adds no tokens must not replace what the original window already decoded.
+        let recovered = mergeChunks(left, right)
+        guard recovered.count > windowData.count else { return windowData }
+        return recovered
+    }
+
+    /// Long inter-emission gaps are suspicious only when their audio is audible. Callers perform
+    /// that acoustic check separately; silence and long pauses must not cause recovery by themselves.
+    static func interiorGaps(
+        timestamps: [Int], window: Range<Int>, samplesPerSecond: Int,
+        thresholdSeconds: Double = ChunkProcessor.headGapThresholdSeconds
+    ) -> [Range<Int>] {
+        zip(timestamps, timestamps.dropFirst()).compactMap { left, right in
+            let start = max(window.lowerBound, left * ASRConstants.samplesPerEncoderFrame)
+            let end = min(window.upperBound, right * ASRConstants.samplesPerEncoderFrame)
+            guard end > start, Double(end - start) / Double(samplesPerSecond) > thresholdSeconds else {
+                return nil
+            }
+            return start..<end
+        }
+    }
+
+    /// Recovery windows need the same acoustic overlap as primary windows. Both children must
+    /// shrink so recursion stays bounded, while the outer boundaries cover every original sample.
+    func recoveryRanges(for window: Range<Int>) -> (left: Range<Int>, right: Range<Int>)? {
+        guard window.count >= Self.minimumRecoverySpanSamples * 2 else { return nil }
+        let mid = frameAligned(window.lowerBound + window.count / 2)
+        let halfOverlap = frameAligned(min(overlapSamples / 2, window.count / 4))
+        let leftEnd = min(mid + halfOverlap, window.upperBound)
+        let rightStart = max(mid - halfOverlap, window.lowerBound)
+        guard leftEnd > window.lowerBound, leftEnd < window.upperBound,
+            rightStart > window.lowerBound, rightStart < window.upperBound else { return nil }
+        return (window.lowerBound..<leftEnd, rightStart..<window.upperBound)
     }
 
     /// Transcribes `[start, end)` with optional prepended context, in absolute timestamps.
