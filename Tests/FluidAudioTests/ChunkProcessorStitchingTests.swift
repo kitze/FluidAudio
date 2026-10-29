@@ -77,8 +77,8 @@ final class ChunkProcessorStitchingTests: XCTestCase {
         let ranges = processor.chunkRanges(forSampleCount: sampleRate * 60)
         guard let windowLength = ranges.first?.count else { return XCTFail("no windows") }
 
-        // The window plus the retry's 4 frames of context must fit the 15s encoder capacity.
-        XCTAssertLessThanOrEqual(windowLength + 4 * frameSamples, maxModelSamples)
+        // Every planned window must fit the 15s encoder capacity on its own.
+        XCTAssertLessThanOrEqual(windowLength, maxModelSamples)
     }
 
     func test_whenWindowsIterated_expectGlobalOffsetConversionIsExact() {
@@ -139,5 +139,60 @@ final class ChunkProcessorStitchingTests: XCTestCase {
         let left: [ChunkProcessor.TokenWindow] = [(10, 50, 0.9), (11, 60, 0.9)]
         let merged = ChunkProcessor(audioSamples: [0]).mergeChunksForTesting(left, [])
         XCTAssertEqual(merged.map { $0.token }, [10, 11])
+    }
+
+    // MARK: - Recovery decision
+
+    /// The failure this guards: a window decodes to nothing (or only in its tail) at the planned
+    /// length, and the merge then deletes that span. The same audio decodes fine at another length,
+    /// so the window has to be re-transcribed rather than accepted.
+    func test_whenWindowDecodesToNothingOnAudibleAudio_expectRecovery() {
+        XCTAssertTrue(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 0, firstTokenStart: nil, lastTokenEnd: nil,
+                windowStart: 16000 * 240, windowEnd: 16000 * 240 + 239_360,
+                isLastWindow: false, hasAudibleAudio: true, samplesPerSecond: 16000))
+    }
+
+    func test_whenWindowDecodesToNothingOnSilence_expectNoRecovery() {
+        XCTAssertFalse(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 0, firstTokenStart: nil, lastTokenEnd: nil,
+                windowStart: 0, windowEnd: 239_360,
+                isLastWindow: false, hasAudibleAudio: false, samplesPerSecond: 16000))
+    }
+
+    func test_whenFirstTokenStartsTenSecondsLate_expectRecovery() {
+        XCTAssertTrue(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 22, firstTokenStart: 16000 * 250, lastTokenEnd: 16000 * 253,
+                windowStart: 16000 * 240, windowEnd: 16000 * 240 + 239_360,
+                isLastWindow: false, hasAudibleAudio: true, samplesPerSecond: 16000))
+    }
+
+    func test_whenWindowCoverageIsTight_expectNoRecovery() {
+        XCTAssertFalse(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 80, firstTokenStart: 16000 * 240 + 1600,
+                lastTokenEnd: 16000 * 240 + 236_000,
+                windowStart: 16000 * 240, windowEnd: 16000 * 240 + 239_360,
+                isLastWindow: true, hasAudibleAudio: true, samplesPerSecond: 16000))
+    }
+
+    func test_whenLastWindowTailIsMissing_expectRecovery() {
+        XCTAssertTrue(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 40, firstTokenStart: 16000 * 240, lastTokenEnd: 16000 * 240 + 100_000,
+                windowStart: 16000 * 240, windowEnd: 16000 * 240 + 239_360,
+                isLastWindow: true, hasAudibleAudio: true, samplesPerSecond: 16000))
+    }
+
+    func test_whenMiddleWindowTailIsMissing_expectNoRecovery() {
+        // The next window covers this tail, so only the last window is checked for a tail gap.
+        XCTAssertFalse(
+            ChunkProcessor.needsRecovery(
+                tokenCount: 40, firstTokenStart: 16000 * 240, lastTokenEnd: 16000 * 240 + 100_000,
+                windowStart: 16000 * 240, windowEnd: 16000 * 240 + 239_360,
+                isLastWindow: false, hasAudibleAudio: true, samplesPerSecond: 16000))
     }
 }

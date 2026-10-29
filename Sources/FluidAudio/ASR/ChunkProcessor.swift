@@ -5,7 +5,6 @@ import OSLog
 struct ChunkProcessor {
     let audioSamples: [Float]
 
-    private let logger = AppLogger(category: "ChunkProcessor")
     typealias TokenWindow = (token: Int, timestamp: Int, confidence: Float)
     private struct IndexedToken {
         let index: Int
@@ -27,20 +26,26 @@ struct ChunkProcessor {
     private let sampleRate: Int = 16000
     private let overlapSeconds: Double = 2.0
 
-    /// Left context used by the single empty-window retry (4 encoder frames = 320ms).
-    private let emptyWindowRetryContextSamples: Int = ASRConstants.samplesPerEncoderFrame * 4
+    /// A window whose first token starts later than this after the window start has lost its head.
+    private static let headGapThresholdSeconds: Double = 1.0
 
-    /// Mean absolute amplitude below which a chunk is treated as silence, so an empty window there
+    /// A last window whose last token ends earlier than this before the window end lost its tail.
+    private static let tailGapThresholdSeconds: Double = 1.0
+
+    /// Recovery splits a bad window in half; stop splitting below this span.
+    private static let minimumRecoverySpanSamples: Int = 32_000  // 2s
+
+    /// How many times a span may be halved while recovering.
+    private static let maximumRecoveryDepth: Int = 3
+
+    /// Mean absolute amplitude below which a span is treated as silence, so an empty decode there
     /// is expected instead of suspicious.
     private let silenceAmplitudeThreshold: Float = 0.001
 
     private var maxModelSamples: Int { 240_000 }  // CoreML encoder capacity (15 seconds)
     private var chunkSamples: Int {
-        // Reserve room for the retry context so chunkSamples + retryContext <= maxModelSamples
-        let raw = max(
-            maxModelSamples - emptyWindowRetryContextSamples - ASRConstants.melHopSize,
-            ASRConstants.samplesPerEncoderFrame)
-        return frameAligned(raw)
+        // Largest frame-aligned window that fits the encoder capacity (187 frames = 14.96s).
+        frameAligned(maxModelSamples - ASRConstants.melHopSize)
     }
     private var overlapSamples: Int {
         let requested = Int(overlapSeconds * Double(sampleRate))
@@ -77,7 +82,6 @@ struct ChunkProcessor {
         var chunkOutputs: [[TokenWindow]] = []
 
         var chunkStart = 0
-        var chunkDecoderState = TdtDecoderState.make()
 
         while chunkStart < audioSamples.count {
             let candidateEnd = chunkStart + chunkSamples
@@ -88,40 +92,13 @@ struct ChunkProcessor {
                 break
             }
 
-            chunkDecoderState.reset()
-
-            let chunkRange = chunkStart..<chunkEnd
-            let chunkSamplesSlice = Array(audioSamples[chunkRange])
-
-            var (windowTokens, windowTimestamps, windowConfidences) = try await transcribeChunk(
-                samples: chunkSamplesSlice,
-                contextSamples: 0,
+            let windowData = try await transcribeWindow(
                 chunkStart: chunkStart,
+                chunkEnd: chunkEnd,
                 isLastChunk: isLastChunk,
-                using: manager,
-                decoderState: &chunkDecoderState
+                using: manager
             )
 
-            // An empty window on audible audio means the decoder produced nothing at all for this
-            // span, and its words are then missing from the merged transcript. Retry once with left
-            // context from the previous window (the boundary-instability case), then carry on.
-            if windowTokens.isEmpty && !isSilent(Array(audioSamples[chunkStart..<chunkEnd])),
-                let retry = await retryEmptyWindow(
-                    chunkStart: chunkStart, chunkEnd: chunkEnd, isLastChunk: isLastChunk, using: manager)
-            {
-                windowTokens = retry.tokens
-                windowTimestamps = retry.timestamps
-                windowConfidences = retry.confidences
-            }
-
-            // Combine tokens, timestamps, and confidences into aligned tuples
-            guard windowTokens.count == windowTimestamps.count && windowTokens.count == windowConfidences.count else {
-                throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
-            }
-
-            let windowData: [TokenWindow] = zip(zip(windowTokens, windowTimestamps), windowConfidences).map {
-                (token: $0.0.0, timestamp: $0.0.1, confidence: $0.1)
-            }
             chunkOutputs.append(windowData)
 
             if isLastChunk {
@@ -166,36 +143,121 @@ struct ChunkProcessor {
         )
     }
 
-    /// Re-transcribes a window that decoded to nothing, feeding left context from the previous
-    /// window. Returns nil when the retry cannot fit the encoder or also yields nothing.
-    private func retryEmptyWindow(
+    /// True when a window's tokens do not cover the window and the missing audio is not silence.
+    ///
+    /// Deterministic blank decodes are real: the same span decodes to nothing at one window length
+    /// and fine at another (14.64s window: 0 tokens; 12.00s / 14.99s window over the same audio:
+    /// full transcript). Without this check such a window contributes nothing to the merge and its
+    /// ~10s of speech is silently deleted from the transcript.
+    static func needsRecovery(
+        tokenCount: Int,
+        firstTokenStart: Int?,
+        lastTokenEnd: Int?,
+        windowStart: Int,
+        windowEnd: Int,
+        isLastWindow: Bool,
+        hasAudibleAudio: Bool,
+        samplesPerSecond: Int,
+        headGapThresholdSeconds: Double = ChunkProcessor.headGapThresholdSeconds,
+        tailGapThresholdSeconds: Double = ChunkProcessor.tailGapThresholdSeconds
+    ) -> Bool {
+        guard hasAudibleAudio else { return false }
+        if tokenCount == 0 || firstTokenStart == nil {
+            return windowEnd - windowStart >= ChunkProcessor.minimumRecoverySpanSamples
+        }
+        let headGap = Double((firstTokenStart ?? windowStart) - windowStart) / Double(samplesPerSecond)
+        if headGap > headGapThresholdSeconds {
+            return true
+        }
+        guard isLastWindow, let lastEnd = lastTokenEnd else { return false }
+        let tailGap = Double(windowEnd - lastEnd) / Double(samplesPerSecond)
+        return tailGap > tailGapThresholdSeconds
+    }
+
+    /// Transcribes one window, and if the result does not cover the window it halves the span and
+    /// transcribes the halves instead, until the span is covered or it is too short to split.
+    ///
+    /// Splitting changes the window length, which is what recovers a span the decoder returned
+    /// nothing for at the original length. Timestamps stay absolute, so the halves merge normally.
+    private func transcribeWindow(
         chunkStart: Int,
         chunkEnd: Int,
         isLastChunk: Bool,
+        depth: Int = 0,
         using manager: AsrManager
-    ) async -> (tokens: [Int], timestamps: [Int], confidences: [Float])? {
-        // The retry must still fit the encoder: window + context <= maxModelSamples.
-        let windowLength = chunkEnd - chunkStart
-        let contextBudget = max(maxModelSamples - windowLength, 0)
-        let retryContextSamples = frameAligned(
-            min(emptyWindowRetryContextSamples, contextBudget, chunkStart))
-        guard retryContextSamples > 0 else { return nil }
+    ) async throws -> [TokenWindow] {
+        let windowData = try await transcribeSpan(
+            start: chunkStart,
+            end: chunkEnd,
+            contextSamples: 0,
+            isLastChunk: isLastChunk,
+            using: manager
+        )
 
-        var retryDecoderState = TdtDecoderState.make()
-        do {
-            let retryResult = try await transcribeChunk(
-                samples: Array(audioSamples[(chunkStart - retryContextSamples)..<chunkEnd]),
-                contextSamples: retryContextSamples,
-                chunkStart: chunkStart,
-                isLastChunk: isLastChunk,
-                using: manager,
-                decoderState: &retryDecoderState
-            )
-            return retryResult.0.isEmpty ? nil : retryResult
-        } catch {
-            // A failed retry must not fail the whole transcription; the window stays empty.
-            logger.warning("Empty-window context retry failed at \(chunkStart) samples: \(error)")
-            return nil
+        let audible = !isSilent(Array(audioSamples[chunkStart..<chunkEnd]))
+        let firstStart = windowData.first.map {
+            Int(Double($0.timestamp) * Double(ASRConstants.samplesPerEncoderFrame))
+        }
+        let lastEnd = windowData.last.map {
+            Int(Double($0.timestamp + 1) * Double(ASRConstants.samplesPerEncoderFrame))
+        }
+        let recover = Self.needsRecovery(
+            tokenCount: windowData.count,
+            firstTokenStart: firstStart,
+            lastTokenEnd: lastEnd,
+            windowStart: chunkStart,
+            windowEnd: chunkEnd,
+            isLastWindow: isLastChunk,
+            hasAudibleAudio: audible,
+            samplesPerSecond: sampleRate
+        )
+        guard recover,
+            depth < Self.maximumRecoveryDepth,
+            chunkEnd - chunkStart >= Self.minimumRecoverySpanSamples * 2
+        else {
+            return windowData
+        }
+
+        let mid = frameAligned(chunkStart + (chunkEnd - chunkStart) / 2)
+        guard mid > chunkStart, mid < chunkEnd else { return windowData }
+
+        let left = try await transcribeWindow(
+            chunkStart: chunkStart, chunkEnd: mid, isLastChunk: false, depth: depth + 1, using: manager)
+        let right = try await transcribeWindow(
+            chunkStart: mid, chunkEnd: chunkEnd, isLastChunk: isLastChunk, depth: depth + 1, using: manager)
+
+        // Keep whichever side produced more: a split that recovers nothing must not replace what
+        // the original window already decoded.
+        guard left.count + right.count > windowData.count else { return windowData }
+        return mergeChunks(left, right)
+    }
+
+    /// Transcribes `[start, end)` with optional prepended context, in absolute timestamps.
+    private func transcribeSpan(
+        start: Int,
+        end: Int,
+        contextSamples: Int,
+        isLastChunk: Bool,
+        using manager: AsrManager
+    ) async throws -> [TokenWindow] {
+        let context = min(contextSamples, start)
+        let contextStart = start - context
+        guard end > contextStart else { return [] }
+
+        var decoderState = TdtDecoderState.make()
+        let (tokens, timestamps, confidences) = try await transcribeChunk(
+            samples: Array(audioSamples[contextStart..<end]),
+            contextSamples: context,
+            chunkStart: start,
+            isLastChunk: isLastChunk,
+            using: manager,
+            decoderState: &decoderState
+        )
+        guard tokens.count == timestamps.count, tokens.count == confidences.count else {
+            throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
+        }
+        return zip(zip(tokens, timestamps), confidences).map {
+            (token: $0.0.0, timestamp: $0.0.1, confidence: $0.1)
         }
     }
 
